@@ -16,8 +16,6 @@ from model import (
 
 from image_utils import save_images_with_white_bg
 
-
-
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(APP_DIR, "attendance.db")
 DATASET_DIR = os.path.join(APP_DIR, "dataset")
@@ -26,7 +24,6 @@ os.makedirs(DATASET_DIR, exist_ok=True)
 TRAIN_STATUS_FILE = os.path.join(APP_DIR, "train_status.json")
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
-
 
 # ---------- DB helpers ----------
 def init_db():
@@ -50,7 +47,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-
 init_db()
 
 # ---------- Train status helpers ----------
@@ -64,7 +60,6 @@ def read_train_status():
     with open(TRAIN_STATUS_FILE, "r") as f:
         return json.load(f)
 
-# ensure initial train status file exists
 write_train_status({"running": False, "progress": 0, "message": "No training yet."})
 
 # ---------- Routes ----------
@@ -72,7 +67,15 @@ write_train_status({"running": False, "progress": 0, "message": "No training yet
 def index():
     return render_template("index.html")
 
-# Dashboard simple API for attendance stats (last 30 days)
+@app.route("/next_roll")
+def next_roll():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT MAX(CAST(roll AS INTEGER)) FROM students WHERE roll != ''")
+    max_roll = c.fetchone()[0] or 0
+    conn.close()
+    return jsonify(next_roll=max_roll + 1)
+
 @app.route("/attendance_stats")
 def attendance_stats():
     import pandas as pd
@@ -84,175 +87,137 @@ def attendance_stats():
         days = [(date.today() - datetime.timedelta(days=i)).strftime("%d-%b") for i in range(29, -1, -1)]
         return jsonify({"dates": days, "counts": [0]*30})
     df['date'] = pd.to_datetime(df['timestamp']).dt.date
-    last_30 = [ (datetime.date.today() - datetime.timedelta(days=i)) for i in range(29, -1, -1) ]
-    counts = [ int(df[df['date'] == d].shape[0]) for d in last_30 ]
-    dates = [ d.strftime("%d-%b") for d in last_30 ]
+    last_30 = [(datetime.date.today() - datetime.timedelta(days=i)) for i in range(29, -1, -1)]
+    counts = [int(df[df['date'] == d].shape[0]) for d in last_30]
+    dates = [d.strftime("%d-%b") for d in last_30]
     return jsonify({"dates": dates, "counts": counts})
 
-# -------- Add student (form) --------
 @app.route("/add_student", methods=["GET", "POST"])
 def add_student():
     if request.method == "GET":
         return render_template("add_student.html")
-    
     data = request.form
-    name = data.get("name","").strip()
-    roll = data.get("roll","").strip()
-    cls = data.get("class","").strip()
-    sec = data.get("sec","").strip()
-    reg_no = data.get("reg_no","").strip()
-    
+    name = data.get("name", "").strip()
+    roll = data.get("roll", "").strip()
+    cls  = data.get("class", "").strip()
+    sec  = data.get("sec", "").strip()
+    reg_no = data.get("reg_no", "").strip()
     if not name:
-        return jsonify({"error":"name required"}), 400
-
+        return jsonify({"error": "name required"}), 400
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-
-    # Check for duplicate roll
     if roll:
         c.execute("SELECT id FROM students WHERE roll = ?", (roll,))
         if c.fetchone():
             conn.close()
             return jsonify({"error": f"Roll number '{roll}' already exists"}), 400
-
-    # Fixed: Use timezone-aware datetime
     now = datetime.datetime.now(datetime.UTC).isoformat()
     c.execute("INSERT INTO students (name, roll, class, section, reg_no, created_at) VALUES (?, ?, ?, ?, ?, ?)",
               (name, roll, cls, sec, reg_no, now))
     sid = c.lastrowid
     conn.commit()
     conn.close()
-
     os.makedirs(os.path.join(DATASET_DIR, str(sid)), exist_ok=True)
     return jsonify({"student_id": sid})
 
-
-# -------- Upload face images (after capture) --------
 @app.route("/upload_face", methods=["POST"])
 def upload_face():
     student_id = request.form.get("student_id")
     if not student_id:
-        return jsonify({"error":"student_id required"}), 400
-    
+        return jsonify({"error": "student_id required"}), 400
     files = request.files.getlist("images[]")
     folder = os.path.join(DATASET_DIR, student_id)
-    
-    # ✅ This now uses the new white-background function
     saved_count = save_images_with_white_bg(files, folder)
-    
     return jsonify({"saved": saved_count})
 
-# -------- Train model (start background thread) --------
 @app.route("/train_model", methods=["GET"])
 def train_model_route():
-    # if already running, respond accordingly
     status = read_train_status()
     if status.get("running"):
-        return jsonify({"status":"already_running"}), 202
-    # reset status
+        return jsonify({"status": "already_running"}), 202
     write_train_status({"running": True, "progress": 0, "message": "Starting training"})
-    # start background thread
     def training_callback(p, m):
         write_train_status({"running": p < 100, "progress": p, "message": m})
-    
     t = threading.Thread(target=train_model_background, args=(DATASET_DIR, training_callback))
     t.daemon = True
     t.start()
-    return jsonify({"status":"started"}), 202
+    return jsonify({"status": "started"}), 202
 
-# -------- Train progress (polling) --------
 @app.route("/train_status", methods=["GET"])
 def train_status():
     return jsonify(read_train_status())
 
-# -------- Mark attendance page --------
 @app.route("/mark_attendance", methods=["GET"])
 def mark_attendance_page():
-    return render_template("mark_attendance.html")
+    import time
+    return render_template("mark_attendance.html", now=time.time())
 
-# Student portal page
 @app.route("/student_portal")
 def student_portal():
     return render_template("student_portal.html")
 
-# -------- Recognize face endpoint (POST image) --------
+# ------------------------------------------------------------------
+# HARDENED RECOGNITION
+# ------------------------------------------------------------------
 @app.route("/recognize_face", methods=["POST"])
 def recognize_face():
     if "image" not in request.files:
         return jsonify({"recognized": False, "error": "no image"}), 400
-
     img_file = request.files["image"]
     try:
-        # extract embeddings (list of np arrays)
         image_bytes = img_file.read()
         embeddings = extract_embedding_for_image(io.BytesIO(image_bytes))
-
         if not embeddings:
             return jsonify({"recognized": False, "error": "no face detected"}), 200
-
-        # use the first embedding only
         emb = embeddings[0]
-
-        # load trained model
         clf = load_model_if_exists()
         if clf is None:
             return jsonify({"recognized": False, "error": "model not trained"}), 200
-
-        # make prediction
         pred_label, conf = predict_with_model(clf, emb)
 
-        # check confidence threshold
-        if conf < 0.5:
-            return jsonify({"recognized": False, "confidence": float(conf)}), 200
+        # ①  stricter gate  (tune 0.8-0.9 as needed)
+        if conf < 0.70:
+            app.logger.warning("Low confidence: student=%s conf=%.2f", pred_label, conf)
+            return jsonify({"recognized": False, "reason": "low_confidence",
+                            "confidence": float(conf)})
 
-        # get student name
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("SELECT name FROM students WHERE id=?", (int(pred_label),))
         row = c.fetchone()
         name = row[0] if row else "Unknown"
 
-        # save attendance
-        # ✅ Check if attendance already exists today
+        # ②  already marked today ?  reject instead of green-ticking
+# ②  already marked today ?  reject but still send name
         today = datetime.datetime.now(datetime.UTC).date().isoformat()
-        c.execute(
-            "SELECT id FROM attendance WHERE student_id=? AND date(timestamp)=?",
-            (int(pred_label), today)
-        )
+        c.execute("SELECT id FROM attendance WHERE student_id=? AND timestamp>=datetime('now','-1 hour')",
+                (int(pred_label),))
         if c.fetchone():
+            c.execute("SELECT name FROM students WHERE id=?", (int(pred_label),))
+            name = c.fetchone()[0] or "Unknown"
             conn.close()
-            return jsonify({
-                "recognized": True,
-                "student_id": int(pred_label),
-                "name": name,
-                "message": "Attendance already marked today"
-            }), 200
+            return jsonify({"recognized": False,
+                            "student_id": int(pred_label),
+                            "name": name,
+                            "error": "Attendance already recorded today"}), 200
 
-        # save attendance if not marked yet
+        # ③  record attendance
         ts = datetime.datetime.now(datetime.UTC).isoformat()
-        c.execute(
-            "INSERT INTO attendance (student_id, name, timestamp) VALUES (?, ?, ?)",
-            (int(pred_label), name, ts)
-        )
+        c.execute("INSERT INTO attendance (student_id, name, timestamp) VALUES (?, ?, ?)",
+                  (int(pred_label), name, ts))
         conn.commit()
         conn.close()
-
-        return jsonify({
-            "recognized": True,
-            "student_id": int(pred_label),
-            "name": name,
-            "confidence": float(conf)
-        }), 200
-
+        return jsonify({"recognized": True,
+                        "student_id": int(pred_label),
+                        "name": name,
+                        "confidence": float(conf)}), 200
     except Exception as e:
         app.logger.exception("recognize error")
         return jsonify({"recognized": False, "error": str(e)}), 500
 
-
-# -------- Attendance records & filters --------
 @app.route("/attendance_record", methods=["GET"])
 def attendance_record():
-    period = request.args.get("period", "all")  # all, daily, weekly, monthly
+    period = request.args.get("period", "all")
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     q = "SELECT id, student_id, name, timestamp FROM attendance"
@@ -274,8 +239,16 @@ def attendance_record():
     rows = c.fetchall()
     conn.close()
     return render_template("attendance_record.html", records=rows, period=period)
+# ---------  COUNT + LIST STUDENTS  ---------
+@app.route("/student_count")
+def student_count():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM students")
+    total = c.fetchone()[0]
+    conn.close()
+    return jsonify({"total_students": total})
 
-# -------- CSV download --------
 @app.route("/download_csv", methods=["GET"])
 def download_csv():
     conn = sqlite3.connect(DB_PATH)
@@ -286,13 +259,12 @@ def download_csv():
     output = io.StringIO()
     output.write("id,student_id,name,timestamp\n")
     for r in rows:
-        output.write(f'{r[0]},{r[1]},{r[2]},{r[3]}\n')
+        output.write(f"{r[0]},{r[1]},{r[2]},{r[3]}\n")
     mem = io.BytesIO()
     mem.write(output.getvalue().encode("utf-8"))
     mem.seek(0)
     return send_file(mem, as_attachment=True, download_name="attendance.csv", mimetype="text/csv")
 
-# -------- Students API for listing/editing --------
 @app.route("/students", methods=["GET"])
 def students_list():
     conn = sqlite3.connect(DB_PATH)
@@ -300,7 +272,8 @@ def students_list():
     c.execute("SELECT id, name, roll, class, section, reg_no, created_at FROM students ORDER BY id DESC")
     rows = c.fetchall()
     conn.close()
-    data = [ {"id":r[0],"name":r[1],"roll":r[2],"class":r[3],"section":r[4],"reg_no":r[5],"created_at":r[6]} for r in rows ]
+    data = [{"id": r[0], "name": r[1], "roll": r[2], "class": r[3],
+             "section": r[4], "reg_no": r[5], "created_at": r[6]} for r in rows]
     return jsonify({"students": data})
 
 @app.route("/students/<int:sid>", methods=["DELETE"])
@@ -311,13 +284,11 @@ def delete_student(sid):
     c.execute("DELETE FROM attendance WHERE student_id=?", (sid,))
     conn.commit()
     conn.close()
-    # also delete dataset folder
     folder = os.path.join(DATASET_DIR, str(sid))
     if os.path.isdir(folder):
         import shutil
         shutil.rmtree(folder, ignore_errors=True)
     return jsonify({"deleted": True})
 
-# ---------------- run ------------------------
 if __name__ == "__main__":
     app.run(debug=True)

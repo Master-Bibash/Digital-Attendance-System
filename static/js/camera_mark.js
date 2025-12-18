@@ -17,7 +17,7 @@ startMarkBtn.addEventListener("click", async () => {
     markVideo.srcObject = markStream;
     await markVideo.play();
     markStatus.innerText = "Scanning...";
-    markInterval = setInterval(captureAndRecognize, 1200);
+    markInterval = setInterval(captureAndRecognize, 3000);
   } catch (err) {
     alert("Camera error: " + err.message);
     startMarkBtn.disabled = false;
@@ -55,8 +55,22 @@ async function captureAndRecognize() {
         recognizedList.prepend(li);
       }
     } else {
-      if (j.error) markStatus.innerText = `Not recognized: ${j.error}`;
-      else markStatus.innerText = `Not recognized`;
+      /*  NEW  */
+      if (j.error === "Attendance already recorded today") {
+        // pretend it was recognised so the user sees the name
+        markStatus.innerText = `✅ ${j.name} already marked today`;
+        if (!recognizedIds.has(j.student_id)) {
+          recognizedIds.add(j.student_id);
+          const li = document.createElement("li");
+          li.className = "list-group-item text-muted";
+          li.innerText = `${j.name} (already marked) — ${new Date().toLocaleTimeString()}`;
+          recognizedList.prepend(li);
+        }
+      } else if (j.error) {
+        markStatus.innerText = `Not recognized: ${j.error}`;
+      } else {
+        markStatus.innerText = "Not recognized";
+      }
     }
   } catch (err) {
     console.error(err);

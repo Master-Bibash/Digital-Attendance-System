@@ -31,9 +31,9 @@ def crop_face_and_embed(bgr_image: np.ndarray, detection) -> Optional[np.ndarray
 
     face = bgr_image[y1:y2, x1:x2]
     face = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
-    face = cv2.resize(face, (32, 32), interpolation=cv2.INTER_AREA)
-
-    emb = face.flatten().astype(np.float32) / 255.0
+    face = cv2.resize(face, (64, 64), interpolation=cv2.INTER_AREA)
+    face = cv2.equalizeHist(face)   # only for grey; skip if you keep colour
+    emb = (face.astype(np.float32) / 255.0).flatten()   # 64*64*3 = 12288
     return emb
 
 
@@ -145,6 +145,7 @@ def train_model_background(
     dataset_dir: str,
     progress_callback: Optional[Callable[[int, str], None]] = None
 ):
+    
     try:
         base_options = mp_tasks.BaseOptions(
             model_asset_path="model/blaze_face_short_range.tflite"
@@ -203,7 +204,10 @@ def train_model_background(
                 emb = crop_face_and_embed(img, results.detections[0])
                 if emb is None:
                     continue
-
+                # NEW: enforce identical vector length
+                if X and emb.shape[0] != X[0].shape[0]:
+                    print(f"[WARN] size mismatch in {path} – skipping")
+                    continue
                 X.append(emb)
                 y.append(int(sid))
 
@@ -219,7 +223,10 @@ def train_model_background(
         if progress_callback:
             progress_callback(95, "Training classifier...")
 
-        clf = RandomForestClassifier(n_estimators=150, random_state=42)
+        clf = RandomForestClassifier(n_estimators=256,
+                             max_depth=20,
+                             min_samples_split=5,
+                             random_state=42)
         clf.fit(np.array(X), np.array(y))
 
         save_model(clf)
