@@ -7,7 +7,8 @@ import json
 from flask import Flask, render_template, request, jsonify, send_file, abort
 from model import train_model_background, extract_embedding_for_image, MODEL_PATH
 from image_utils import save_images_with_white_bg
-
+from model import CONFIDENCE_THRESHOLD
+import shutil
 
 train_status_lock = threading.Lock()
 
@@ -37,6 +38,7 @@ app = Flask(__name__, static_folder="static", template_folder="templates")
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    # ---- students table ----
     c.execute("""CREATE TABLE IF NOT EXISTS students (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL,
@@ -46,15 +48,16 @@ def init_db():
                     reg_no TEXT,
                     created_at TEXT
                 )""")
+    # ---- attendance table ----
     c.execute("""CREATE TABLE IF NOT EXISTS attendance (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     student_id INTEGER,
                     name TEXT,
-                    timestamp TEXT
+                    timestamp TEXT,
+                    UNIQUE(student_id, date(timestamp))
                 )""")
     conn.commit()
     conn.close()
-
 
 init_db()
 
@@ -199,7 +202,7 @@ def recognize_face():
         pred_label, conf = predict_with_model(clf, emb)
 
         # check confidence threshold
-        if conf < 0.5:
+        if conf < CONFIDENCE_THRESHOLD:
             return jsonify({"recognized": False, "confidence": float(conf)}), 200
 
         # get student name
@@ -212,27 +215,23 @@ def recognize_face():
         # save attendance
         # ✅ Check if attendance already exists today
         today = datetime.datetime.utcnow().date().isoformat()
-        c.execute(
-            "SELECT id FROM attendance WHERE student_id=? AND date(timestamp)=?",
-            (int(pred_label), today)
-        )
-        if c.fetchone():
+        ts   = datetime.datetime.utcnow().isoformat()   # <-- add this line
+        try:
+            c.execute(
+                "INSERT OR IGNORE INTO attendance (student_id, name, timestamp) VALUES (?, ?, ?)",
+                (int(pred_label), name, ts)
+            )
+            conn.commit()
+            if c.rowcount == 0:          # duplicate
+                conn.close()
+                return jsonify({
+                    "recognized": True,
+                    "student_id": int(pred_label),
+                    "name": name,
+                    "message": "Attendance already marked today"
+                }), 200
+        finally:
             conn.close()
-            return jsonify({
-                "recognized": True,
-                "student_id": int(pred_label),
-                "name": name,
-                "message": "Attendance already marked today"
-            }), 200
-
-        # save attendance if not marked yet
-        ts = datetime.datetime.utcnow().isoformat()
-        c.execute(
-            "INSERT INTO attendance (student_id, name, timestamp) VALUES (?, ?, ?)",
-            (int(pred_label), name, ts)
-        )
-        conn.commit()
-        conn.close()
 
 
         return jsonify({
@@ -312,10 +311,9 @@ def delete_student(sid):
     # also delete dataset folder
     folder = os.path.join(DATASET_DIR, str(sid))
     if os.path.isdir(folder):
-        import shutil
         shutil.rmtree(folder, ignore_errors=True)
     return jsonify({"deleted": True})
 
-# ---------------- run ------------------------
 if __name__ == "__main__":
-    app.run(debug=True)
+    import os
+    app.run(debug=os.getenv("FLASK_ENV") == "development")

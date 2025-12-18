@@ -8,14 +8,12 @@ import pickle
 from typing import List, Optional, Dict, Tuple, Callable
 from sklearn.ensemble import RandomForestClassifier
 import mediapipe as mp
-
+MODEL_PATH = "model.pkl"
+from model import CONFIDENCE_THRESHOLD
 from image_utils import make_background_white_with_face   # authoritative version
 
-MODEL_PATH = "model.pkl"
 
-# ------------------------------------------------------------------
-# 1.  embedding helpers
-# ------------------------------------------------------------------
+
 def crop_face_and_embed(bgr_image: np.ndarray, detection) -> Optional[np.ndarray]:
     """Crop face, convert to 32×32 grey, flatten, L2-normalise."""
     h, w = bgr_image.shape[:2]
@@ -85,7 +83,7 @@ def predict_with_model(clf: RandomForestClassifier, emb: np.ndarray) -> Tuple[in
 
 def predict_multiple_faces(clf: RandomForestClassifier,
                            embeddings: List[np.ndarray],
-                           threshold: float = 0.5) -> Dict:
+                           threshold: float = CONFIDENCE_THRESHOLD) -> Dict:
     """Vote over many faces (same image)."""
     preds = [predict_with_model(clf, e) for e in embeddings]
     filtered = [(lbl, conf) for lbl, conf in preds if conf >= threshold]

@@ -8,7 +8,7 @@ const progressBar = document.getElementById("progressBar");
 
 let student_id = null;
 let captured = 0;
-const maxImages = 50;
+const maxImages = 20;
 let images = [];
 let stream = null;
 
