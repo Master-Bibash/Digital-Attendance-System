@@ -9,6 +9,21 @@ from model import train_model_background, extract_embedding_for_image, MODEL_PAT
 from image_utils import save_images_with_white_bg
 
 
+train_status_lock = threading.Lock()
+
+def write_train_status(status_dict):
+    with train_status_lock:
+        with open(TRAIN_STATUS_FILE, "w") as f:
+            json.dump(status_dict, f)
+
+def read_train_status():
+    with train_status_lock:
+        if not os.path.exists(TRAIN_STATUS_FILE):
+            return {"running": False, "progress": 0, "message": "Not trained"}
+        with open(TRAIN_STATUS_FILE, "r") as f:
+            return json.load(f)
+
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(APP_DIR, "attendance.db")
 DATASET_DIR = os.path.join(APP_DIR, "dataset")
@@ -43,16 +58,8 @@ def init_db():
 
 init_db()
 
-# ---------- Train status helpers ----------
-def write_train_status(status_dict):
-    with open(TRAIN_STATUS_FILE, "w") as f:
-        json.dump(status_dict, f)
 
-def read_train_status():
-    if not os.path.exists(TRAIN_STATUS_FILE):
-        return {"running": False, "progress": 0, "message": "Not trained"}
-    with open(TRAIN_STATUS_FILE, "r") as f:
-        return json.load(f)
+
 
 # ensure initial train status file exists
 write_train_status({"running": False, "progress": 0, "message": "No training yet."})
@@ -124,10 +131,15 @@ def upload_face():
         return jsonify({"error":"student_id required"}), 400
     
     files = request.files.getlist("images[]")
-    folder = os.path.join(DATASET_DIR, student_id)
+    try:
+        student_id = int(request.form.get("student_id"))
+    except (TypeError, ValueError):
+        abort(400)
     
     # ✅ This now uses the new white-background function
+    folder = os.path.join(DATASET_DIR, str(student_id))
     saved_count = save_images_with_white_bg(files, folder)
+
     
     return jsonify({"saved": saved_count})
 
