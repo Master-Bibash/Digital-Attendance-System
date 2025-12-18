@@ -1,47 +1,76 @@
-"""
-model.py  –  embedding extraction + Random-Forest training / inference
-"""
 import os
 import cv2
 import numpy as np
 import pickle
-from typing import List, Optional, Dict, Tuple, Callable
 from sklearn.ensemble import RandomForestClassifier
-import mediapipe as mp
+from typing import List, Optional, Dict, Tuple, Callable
+from mediapipe.tasks import python as mp_tasks
+from mediapipe.tasks.python import vision
+
+
 MODEL_PATH = "model.pkl"
-from model import CONFIDENCE_THRESHOLD
-from image_utils import make_background_white_with_face   # authoritative version
 
 
-
+# ------------------------------------
+# Crop face & create embedding
+# ------------------------------------
 def crop_face_and_embed(bgr_image: np.ndarray, detection) -> Optional[np.ndarray]:
-    """Crop face, convert to 32×32 grey, flatten, L2-normalise."""
     h, w = bgr_image.shape[:2]
-    bbox = detection.location_data.relative_bounding_box
-    x1 = int(max(0, bbox.xmin * w))
-    y1 = int(max(0, bbox.ymin * h))
-    x2 = int(min(w, (bbox.xmin + bbox.width) * w))
-    y2 = int(min(h, (bbox.ymin + bbox.height) * h))
+    
+    # Fixed: MediaPipe Tasks API uses bounding_box instead of location_data.relative_bounding_box
+    bbox = detection.bounding_box
+    
+    # bbox has origin_x, origin_y, width, height (in pixels, not relative)
+    x1 = int(max(0, bbox.origin_x))
+    y1 = int(max(0, bbox.origin_y))
+    x2 = int(min(w, bbox.origin_x + bbox.width))
+    y2 = int(min(h, bbox.origin_y + bbox.height))
 
     if x2 <= x1 or y2 <= y1:
         return None
 
-    face = cv2.cvtColor(bgr_image[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+    face = bgr_image[y1:y2, x1:x2]
+    face = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
     face = cv2.resize(face, (32, 32), interpolation=cv2.INTER_AREA)
-    return (face.flatten().astype(np.float32) / 255.0)
+
+    emb = face.flatten().astype(np.float32) / 255.0
+    return emb
 
 
+# ------------------------------------
+# Extract embeddings from image
+# ------------------------------------
 def extract_embedding_for_image(stream_or_bytes, first_only: bool = True) -> List[np.ndarray]:
-    """Return list of face embeddings (length 0 … N) from file-like object."""
+    base_options = mp_tasks.BaseOptions(
+        model_asset_path="model/blaze_face_short_range.tflite"
+    )
+
+    detector_options = vision.FaceDetectorOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.IMAGE,
+        min_detection_confidence=0.5
+    )
+
+    face_detector = vision.FaceDetector.create_from_options(detector_options)
+
     data = stream_or_bytes.read()
-    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    arr = np.frombuffer(data, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
         return []
 
-    # thread-safe: create a NEW detector every call (cost ≈ 2 ms)
-    mp_face = mp.solutions.face_detection.FaceDetection(
-        model_selection=1, min_detection_confidence=0.5)
-    results = mp_face.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    rgb_image = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    # Fixed: Use correct import path for Image
+    from mediapipe import Image as mp_Image
+    from mediapipe import ImageFormat
+    
+    mp_image = mp_Image(
+        image_format=ImageFormat.SRGB,
+        data=rgb_image
+    )
+
+    results = face_detector.detect(mp_image)
     if not results.detections:
         return []
 
@@ -50,103 +79,155 @@ def extract_embedding_for_image(stream_or_bytes, first_only: bool = True) -> Lis
         emb = crop_face_and_embed(img, det)
         if emb is not None:
             embeddings.append(emb)
-            if first_only:
-                break
+        if first_only:
+            break
+
     return embeddings
 
 
-# ------------------------------------------------------------------
-# 2.  model I/O
-# ------------------------------------------------------------------
+# ------------------------------------
+# Model load / save
+# ------------------------------------
 def load_model_if_exists() -> Optional[RandomForestClassifier]:
-    return pickle.load(open(MODEL_PATH, "rb")) if os.path.exists(MODEL_PATH) else None
+    if not os.path.exists(MODEL_PATH):
+        return None
+    with open(MODEL_PATH, "rb") as f:
+        return pickle.load(f)
 
 
-def save_model(clf: RandomForestClassifier) -> None:
-    tmp = MODEL_PATH + ".tmp"
-    with open(tmp, "wb") as f:
+def save_model(clf: RandomForestClassifier):
+    with open(MODEL_PATH, "wb") as f:
         pickle.dump(clf, f)
-    os.replace(tmp, MODEL_PATH)          # atomic on POSIX and Win
 
 
-# ------------------------------------------------------------------
-# 3.  prediction
-# ------------------------------------------------------------------
+# ------------------------------------
+# Predict single embedding
+# ------------------------------------
 def predict_with_model(clf: RandomForestClassifier, emb: np.ndarray) -> Tuple[int, float]:
-    """Single embedding → (student_id, confidence)."""
     proba = clf.predict_proba([emb])[0]
-    if np.allclose(proba, 0.0):
-        return -1, 0.0
     idx = int(np.argmax(proba))
-    return int(clf.classes_[idx]), float(proba[idx])
+    label = int(clf.classes_[idx])
+    conf = float(proba[idx])
+    return label, conf
 
 
-def predict_multiple_faces(clf: RandomForestClassifier,
-                           embeddings: List[np.ndarray],
-                           threshold: float = CONFIDENCE_THRESHOLD) -> Dict:
-    """Vote over many faces (same image)."""
-    preds = [predict_with_model(clf, e) for e in embeddings]
-    filtered = [(lbl, conf) for lbl, conf in preds if conf >= threshold]
+# ------------------------------------
+# Predict multiple faces
+# ------------------------------------
+def predict_multiple_faces(
+    clf: RandomForestClassifier,
+    embeddings: List[np.ndarray],
+    threshold: float = 0.5
+) -> Dict:
+
+    predictions = []
+    for emb in embeddings:
+        label, conf = predict_with_model(clf, emb)
+        predictions.append({"label": label, "confidence": conf})
+
+    filtered = [p for p in predictions if p["confidence"] >= threshold]
     if not filtered:
-        return {"recognized": False, "winner_label": None}
+        return {"recognized": False}
 
-    # average confidence per label
-    conf_per_label: Dict[int, List[float]] = {}
-    for lbl, conf in filtered:
-        conf_per_label.setdefault(lbl, []).append(conf)
-    avg_conf = {lbl: sum(c) / len(c) for lbl, c in conf_per_label.items()}
-    winner = max(avg_conf, key=avg_conf.get)
-    return {"recognized": True,
-            "winner_label": winner,
-            "average_confidence": avg_conf[winner]}
+    winner = max(filtered, key=lambda x: x["confidence"])
+
+    return {
+        "recognized": True,
+        "label": winner["label"],
+        "confidence": winner["confidence"]
+    }
 
 
-# ------------------------------------------------------------------
-# 4.  training
-# ------------------------------------------------------------------
-def train_model_background(dataset_dir: str,
-                           progress_callback: Optional[Callable[[int, str], None]] = None) -> None:
-    """Train Random-Forest on white-bg images inside dataset_dir."""
-    mp_face = mp.solutions.face_detection.FaceDetection(
-        model_selection=1, min_detection_confidence=0.5)
+# ------------------------------------
+# Train model (BACKGROUND THREAD)
+# ------------------------------------
+def train_model_background(
+    dataset_dir: str,
+    progress_callback: Optional[Callable[[int, str], None]] = None
+):
+    try:
+        base_options = mp_tasks.BaseOptions(
+            model_asset_path="model/blaze_face_short_range.tflite"
+        )
 
-    X, y = [], []
-    student_dirs = [d for d in os.listdir(dataset_dir)
-                    if os.path.isdir(os.path.join(dataset_dir, d))]
-    total = max(1, len(student_dirs))
+        detector_options = vision.FaceDetectorOptions(
+            base_options=base_options,
+            running_mode=vision.RunningMode.IMAGE,
+            min_detection_confidence=0.5
+        )
 
-    for idx, sid in enumerate(student_dirs, 1):
-        folder = os.path.join(dataset_dir, sid)
-        for fn in os.listdir(folder):
-            if not fn.lower().endswith((".jpg", ".jpeg", ".png")):
-                continue
-            img = cv2.imread(os.path.join(folder, fn))
-            if img is None:
-                continue
+        mp_face = vision.FaceDetector.create_from_options(detector_options)
 
-            img = make_background_white_with_face(img)          # authoritative
-            results = mp_face.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-            if not results.detections:
-                continue
+        # Fixed: Import Image class correctly
+        from mediapipe import Image as mp_Image
+        from mediapipe import ImageFormat
 
-            emb = crop_face_and_embed(img, results.detections[0])
-            if emb is not None:
+        X, y = [], []
+
+        student_dirs = [
+            d for d in os.listdir(dataset_dir)
+            if os.path.isdir(os.path.join(dataset_dir, d))
+        ]
+
+        if not student_dirs:
+            if progress_callback:
+                progress_callback(0, "No student folders found")
+            return
+
+        total = len(student_dirs)
+
+        for idx, sid in enumerate(student_dirs, start=1):
+            folder = os.path.join(dataset_dir, sid)
+
+            for file in os.listdir(folder):
+                if not file.lower().endswith((".jpg", ".png", ".jpeg")):
+                    continue
+
+                path = os.path.join(folder, file)
+                img = cv2.imread(path)
+                if img is None:
+                    continue
+
+                rgb_image = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+                # Fixed: Use correct Image class
+                mp_image = mp_Image(
+                    image_format=ImageFormat.SRGB,
+                    data=rgb_image
+                )
+
+                results = mp_face.detect(mp_image)
+                if not results.detections:
+                    continue
+
+                emb = crop_face_and_embed(img, results.detections[0])
+                if emb is None:
+                    continue
+
                 X.append(emb)
                 y.append(int(sid))
 
+            if progress_callback:
+                progress = int((idx / total) * 100)
+                progress_callback(progress, f"Processed {idx}/{total} students")
+
+        if not X:
+            if progress_callback:
+                progress_callback(0, "No faces detected in any images")
+            return
+
         if progress_callback:
-            pct = int(idx / total * 100)
-            progress_callback(pct, f"Processed {idx}/{total} students")
+            progress_callback(95, "Training classifier...")
 
-    if not X:
+        clf = RandomForestClassifier(n_estimators=150, random_state=42)
+        clf.fit(np.array(X), np.array(y))
+
+        save_model(clf)
+
         if progress_callback:
-            progress_callback(0, "No training data found")
-        return
-
-    clf = RandomForestClassifier(n_estimators=150, n_jobs=-1, random_state=42)
-    clf.fit(np.stack(X), np.array(y))
-    save_model(clf)
-    if progress_callback:
-        progress_callback(100, "Training complete")
-
-
+            progress_callback(100, "Training completed successfully")
+            
+    except Exception as e:
+        if progress_callback:
+            progress_callback(0, f"Training error: {str(e)}")
+        raise

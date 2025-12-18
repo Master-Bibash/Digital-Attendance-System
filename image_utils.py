@@ -1,76 +1,55 @@
+"""
+image_utils.py – simple white background image saver (NO MediaPipe Tasks)
+"""
 
 import os
 import cv2
 import numpy as np
-import uuid
 from typing import List
 from werkzeug.datastructures import FileStorage
 
-# ------------------------------------------------------------------
-# single public helper  (used by both training and Flask routes)
-# ------------------------------------------------------------------
-def make_background_white_with_face(img: np.ndarray) -> np.ndarray:
+
+# -------------------------------------------------
+# Simple white background (no face detection here)
+# -------------------------------------------------
+def make_background_white_simple(img: np.ndarray) -> np.ndarray:
     """
-    HSV skin/hair mask → GrabCut → largest-contour → white background
-    Thread-safe: creates its own MediaPipe detector every call.
+    Convert light background to white using grayscale threshold.
     """
-    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    _, mask = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
     white_bg = np.ones_like(img, dtype=np.uint8) * 255
+    mask_3c = cv2.merge([mask, mask, mask])
 
-    # ---- 1.  skin + hair mask ------------------------------------
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    mask_skin = cv2.inRange(hsv, np.array([0, 30, 60]),   np.array([20, 180, 255]))
-    mask_hair = cv2.inRange(hsv, np.array([0, 0, 0]),     np.array([180, 100, 120]))
-    mask = cv2.bitwise_or(mask_skin, mask_hair)
+    fg = cv2.bitwise_and(img, cv2.bitwise_not(mask_3c))
+    bg = cv2.bitwise_and(white_bg, mask_3c)
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=4)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel,  iterations=2)
-    mask = cv2.GaussianBlur(mask, (7, 7), 0)
-
-    # ---- 2.  GrabCut refine --------------------------------------
-    gc_mask = np.where(mask > 0, cv2.GC_PR_FGD, cv2.GC_PR_BGD).astype('uint8')
-    bgd = np.zeros((1, 65), np.float64)
-    fgd = np.zeros((1, 65), np.float64)
-    cv2.grabCut(img, gc_mask, None, bgd, fgd, 5, cv2.GC_INIT_WITH_MASK)
-    mask_final = np.where((gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD), 255, 0).astype('uint8')
-
-    # ---- 3.  keep largest contour -------------------------------
-    contours, _ = cv2.findContours(mask_final, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        largest = max(contours, key=cv2.contourArea)
-        mask_clean = np.zeros((h, w), dtype=np.uint8)
-        cv2.drawContours(mask_clean, [largest], -1, 255, thickness=cv2.FILLED)
-        mask_final = cv2.GaussianBlur(mask_clean, (7, 7), 0)
-
-    # ---- 4.  composite ------------------------------------------
-    mask_bgr = cv2.cvtColor(mask_final, cv2.COLOR_GRAY2BGR)
-    fg   = cv2.bitwise_and(img, mask_bgr)
-    bg   = cv2.bitwise_and(white_bg, cv2.bitwise_not(mask_bgr))
     return cv2.add(fg, bg)
 
 
+# -------------------------------------------------
+# Save uploaded images with white background
+# -------------------------------------------------
 def save_images_with_white_bg(files: List[FileStorage], folder: str) -> int:
     os.makedirs(folder, exist_ok=True)
+    saved_count = 0
 
-    # 1.  preprocess & write new images to *temporary* names
-    tmp_paths = []
     for f in files:
-        buf = f.read()
-        img = cv2.imdecode(np.frombuffer(buf, np.uint8), cv2.IMREAD_COLOR)
+        data = f.read()
+        arr = np.frombuffer(data, np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
-            print(f"warning: corrupted image {f.filename}")   # or app_log
             continue
-        img_white = make_background_white_with_face(img)
-        tmp = os.path.join(folder, f"{uuid.uuid4().hex}.jpg")
-        if cv2.imwrite(tmp, img_white):
-            tmp_paths.append(tmp)
 
-    # 2.  only now that we *know* the new images are on disk, delete olds
-    for old in os.listdir(folder):
-        if old.endswith(".jpg"):
-            os.remove(os.path.join(folder, old))
+        img_white = make_background_white_simple(img)
 
-    # 3.  optional: rename temps to final names (keeps uuid anyway)
-    saved = len(tmp_paths)
-    return saved
+        filename = os.path.join(folder, f"{saved_count + 1}.jpg")
+        cv2.imwrite(filename, img_white)
+        saved_count += 1
+
+    return saved_count

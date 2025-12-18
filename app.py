@@ -4,25 +4,18 @@ import threading
 import sqlite3
 import datetime
 import json
+
 from flask import Flask, render_template, request, jsonify, send_file, abort
-from model import train_model_background, extract_embedding_for_image, MODEL_PATH
+
+from model import (
+    load_model_if_exists,
+    extract_embedding_for_image,
+    train_model_background,
+    predict_with_model
+)
+
 from image_utils import save_images_with_white_bg
-from model import CONFIDENCE_THRESHOLD
-import shutil
 
-train_status_lock = threading.Lock()
-
-def write_train_status(status_dict):
-    with train_status_lock:
-        with open(TRAIN_STATUS_FILE, "w") as f:
-            json.dump(status_dict, f)
-
-def read_train_status():
-    with train_status_lock:
-        if not os.path.exists(TRAIN_STATUS_FILE):
-            return {"running": False, "progress": 0, "message": "Not trained"}
-        with open(TRAIN_STATUS_FILE, "r") as f:
-            return json.load(f)
 
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -34,11 +27,11 @@ TRAIN_STATUS_FILE = os.path.join(APP_DIR, "train_status.json")
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
+
 # ---------- DB helpers ----------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # ---- students table ----
     c.execute("""CREATE TABLE IF NOT EXISTS students (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL,
@@ -48,21 +41,28 @@ def init_db():
                     reg_no TEXT,
                     created_at TEXT
                 )""")
-    # ---- attendance table ----
     c.execute("""CREATE TABLE IF NOT EXISTS attendance (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     student_id INTEGER,
                     name TEXT,
-                    timestamp TEXT,
-                    UNIQUE(student_id, date(timestamp))
+                    timestamp TEXT
                 )""")
     conn.commit()
     conn.close()
 
+
 init_db()
 
+# ---------- Train status helpers ----------
+def write_train_status(status_dict):
+    with open(TRAIN_STATUS_FILE, "w") as f:
+        json.dump(status_dict, f)
 
-
+def read_train_status():
+    if not os.path.exists(TRAIN_STATUS_FILE):
+        return {"running": False, "progress": 0, "message": "Not trained"}
+    with open(TRAIN_STATUS_FILE, "r") as f:
+        return json.load(f)
 
 # ensure initial train status file exists
 write_train_status({"running": False, "progress": 0, "message": "No training yet."})
@@ -115,7 +115,8 @@ def add_student():
             conn.close()
             return jsonify({"error": f"Roll number '{roll}' already exists"}), 400
 
-    now = datetime.datetime.utcnow().isoformat()
+    # Fixed: Use timezone-aware datetime
+    now = datetime.datetime.now(datetime.UTC).isoformat()
     c.execute("INSERT INTO students (name, roll, class, section, reg_no, created_at) VALUES (?, ?, ?, ?, ?, ?)",
               (name, roll, cls, sec, reg_no, now))
     sid = c.lastrowid
@@ -134,15 +135,10 @@ def upload_face():
         return jsonify({"error":"student_id required"}), 400
     
     files = request.files.getlist("images[]")
-    try:
-        student_id = int(request.form.get("student_id"))
-    except (TypeError, ValueError):
-        abort(400)
+    folder = os.path.join(DATASET_DIR, student_id)
     
     # ✅ This now uses the new white-background function
-    folder = os.path.join(DATASET_DIR, str(student_id))
     saved_count = save_images_with_white_bg(files, folder)
-
     
     return jsonify({"saved": saved_count})
 
@@ -156,7 +152,10 @@ def train_model_route():
     # reset status
     write_train_status({"running": True, "progress": 0, "message": "Starting training"})
     # start background thread
-    t = threading.Thread(target=train_model_background, args=(DATASET_DIR, lambda p,m: write_train_status({"running": True, "progress": p, "message": m})))
+    def training_callback(p, m):
+        write_train_status({"running": p < 100, "progress": p, "message": m})
+    
+    t = threading.Thread(target=train_model_background, args=(DATASET_DIR, training_callback))
     t.daemon = True
     t.start()
     return jsonify({"status":"started"}), 202
@@ -170,12 +169,12 @@ def train_status():
 @app.route("/mark_attendance", methods=["GET"])
 def mark_attendance_page():
     return render_template("mark_attendance.html")
+
 # Student portal page
 @app.route("/student_portal")
 def student_portal():
     return render_template("student_portal.html")
 
-# -------- Recognize face endpoint (POST image) --------
 # -------- Recognize face endpoint (POST image) --------
 @app.route("/recognize_face", methods=["POST"])
 def recognize_face():
@@ -185,7 +184,9 @@ def recognize_face():
     img_file = request.files["image"]
     try:
         # extract embeddings (list of np arrays)
-        embeddings = extract_embedding_for_image(img_file.stream)
+        image_bytes = img_file.read()
+        embeddings = extract_embedding_for_image(io.BytesIO(image_bytes))
+
         if not embeddings:
             return jsonify({"recognized": False, "error": "no face detected"}), 200
 
@@ -193,7 +194,6 @@ def recognize_face():
         emb = embeddings[0]
 
         # load trained model
-        from model import load_model_if_exists, predict_with_model
         clf = load_model_if_exists()
         if clf is None:
             return jsonify({"recognized": False, "error": "model not trained"}), 200
@@ -202,7 +202,7 @@ def recognize_face():
         pred_label, conf = predict_with_model(clf, emb)
 
         # check confidence threshold
-        if conf < CONFIDENCE_THRESHOLD:
+        if conf < 0.5:
             return jsonify({"recognized": False, "confidence": float(conf)}), 200
 
         # get student name
@@ -214,25 +214,28 @@ def recognize_face():
 
         # save attendance
         # ✅ Check if attendance already exists today
-        today = datetime.datetime.utcnow().date().isoformat()
-        ts   = datetime.datetime.utcnow().isoformat()   # <-- add this line
-        try:
-            c.execute(
-                "INSERT OR IGNORE INTO attendance (student_id, name, timestamp) VALUES (?, ?, ?)",
-                (int(pred_label), name, ts)
-            )
-            conn.commit()
-            if c.rowcount == 0:          # duplicate
-                conn.close()
-                return jsonify({
-                    "recognized": True,
-                    "student_id": int(pred_label),
-                    "name": name,
-                    "message": "Attendance already marked today"
-                }), 200
-        finally:
+        today = datetime.datetime.now(datetime.UTC).date().isoformat()
+        c.execute(
+            "SELECT id FROM attendance WHERE student_id=? AND date(timestamp)=?",
+            (int(pred_label), today)
+        )
+        if c.fetchone():
             conn.close()
+            return jsonify({
+                "recognized": True,
+                "student_id": int(pred_label),
+                "name": name,
+                "message": "Attendance already marked today"
+            }), 200
 
+        # save attendance if not marked yet
+        ts = datetime.datetime.now(datetime.UTC).isoformat()
+        c.execute(
+            "INSERT INTO attendance (student_id, name, timestamp) VALUES (?, ?, ?)",
+            (int(pred_label), name, ts)
+        )
+        conn.commit()
+        conn.close()
 
         return jsonify({
             "recognized": True,
@@ -311,9 +314,10 @@ def delete_student(sid):
     # also delete dataset folder
     folder = os.path.join(DATASET_DIR, str(sid))
     if os.path.isdir(folder):
+        import shutil
         shutil.rmtree(folder, ignore_errors=True)
     return jsonify({"deleted": True})
 
+# ---------------- run ------------------------
 if __name__ == "__main__":
-    import os
-    app.run(debug=os.getenv("FLASK_ENV") == "development")
+    app.run(debug=True)
