@@ -22,6 +22,14 @@
             <div class="col-md-6"><input class="form-control" name="class" placeholder="Class"></div>
             <div class="col-md-6"><input class="form-control" name="sec" placeholder="Section"></div>
           </div>
+          <!-- UPLOAD SECTION -->
+          <hr>
+          <div class="text-center">
+            <label class="form-label">…or upload photos</label>
+            <input type="file" id="photoInput" class="form-control mb-2" multiple accept="image/*">
+            <button id="uploadBtn" type="button" class="btn btn-info" disabled>Upload & Save</button>
+            <div id="uploadStatus" class="small text-muted mt-1"></div>
+          </div>
           <div class="mt-3 d-flex gap-2">
             <button id="saveInfoBtn" type="submit" class="btn btn-primary">Save Info</button>
             <button id="startCaptureBtn" type="button" class="btn btn-warning" disabled>Start Capture (50)</button>

@@ -6,26 +6,31 @@ const video = document.getElementById("video");
 const captureStatus = document.getElementById("captureStatus");
 const progressBar = document.getElementById("progressBar");
 
+const photoInput = document.getElementById('photoInput');
+const uploadBtn = document.getElementById('uploadBtn');
+const uploadStat = document.getElementById('uploadStatus');
+
 let student_id = null;
 let captured = 0;
-const maxImages = 20;
+const maxImages = 50;
 let images = [];
 let stream = null;
 
+/* ---------- student info ---------- */
 document.getElementById("studentForm").addEventListener("submit", async (e) => {
   e.preventDefault();
   const fd = new FormData(e.target);
   const res = await fetch("/add_student", { method: "POST", body: fd });
-  if (!res.ok) {
-    alert("Failed to save student info");
-    return;
-  }
+  if (!res.ok) { alert("Failed to save student info"); return; }
   const j = await res.json();
   student_id = j.student_id;
-  alert("Student info saved. Click Start Capture to open the camera.");
+  alert("Student info saved. Choose capture or upload.");
   startCaptureBtn.disabled = false;
+  uploadBtn.disabled = false;
+  document.dispatchEvent(new Event('studentSaved')); // unlock upload
 });
 
+/* ---------- live capture ---------- */
 startCaptureBtn.addEventListener("click", async () => {
   startCaptureBtn.disabled = true;
   try {
@@ -52,11 +57,9 @@ async function captureImagesLoop() {
     captured++;
     captureStatus.innerText = `Captured ${captured} / ${maxImages}`;
     progressBar.style.width = `${(captured / maxImages) * 100}%`;
-    // small visual flash
     await new Promise(r => setTimeout(r, 200));
   }
 
-  // upload all images in one request
   const form = new FormData();
   form.append("student_id", student_id);
   images.forEach((b, i) => form.append("images[]", b, `img_${i}.jpg`));
@@ -67,12 +70,34 @@ async function captureImagesLoop() {
   } else {
     alert("Upload failed");
   }
-
-  // stop camera
   if (stream) stream.getTracks().forEach(t => t.stop());
 }
 
+/* ---------- photo upload ---------- */
+uploadBtn.addEventListener('click', async () => {
+  const files = photoInput.files;
+  if (!files.length) { uploadStat.innerText = "Choose at least one photo"; return; }
+
+  const fd = new FormData();
+  for (let f of files) fd.append("images[]", f);
+  fd.append("student_id", student_id);
+
+  uploadStat.innerText = "Uploading...";
+  const res = await fetch("/upload_face", { method: "POST", body: fd });
+  const j = await res.json();
+  uploadStat.innerText = res.ok ? `✅ Uploaded ${j.saved} photos` : "❌ Upload failed";
+  if (res.ok) addStudentBtn.disabled = false;
+});
+
+/* ---------- finish ---------- */
 addStudentBtn.addEventListener("click", () => {
   alert("Student record complete. Returning to dashboard.");
   window.location.href = "/";
+});
+
+/* ---------- optional: hide capture when files chosen ---------- */
+photoInput.addEventListener('change', () => {
+  const useUpload = photoInput.files.length > 0;
+  document.getElementById('startCaptureBtn').style.display = useUpload ? 'none' : 'inline-block';
+  document.getElementById('captureStatus').style.display   = useUpload ? 'none' : 'block';
 });

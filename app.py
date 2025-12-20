@@ -4,8 +4,7 @@ import threading
 import sqlite3
 import datetime
 import json
-
-from flask import Flask, render_template, request, jsonify, send_file, abort
+from flask import Flask, render_template, request, jsonify, send_file
 
 from model import (
     load_model_if_exists,
@@ -14,12 +13,104 @@ from model import (
     predict_with_model
 )
 
-from image_utils import save_images_with_white_bg
+def rgb_to_grayscale(rgb_image):
+    """
+    Convert an RGB image to grayscale.
+    
+    :param rgb_image: A 3D list of RGB pixel values [[(R, G, B), ...], ...]
+    :return: A 2D list of grayscale pixel values [[gray, ...], ...]
+    """
+    height = len(rgb_image)
+    width = len(rgb_image[0])
+    
+    grayscale_image = []
+    
+    for y in range(height):
+        grayscale_row = []
+        for x in range(width):
+            r, g, b = rgb_image[y][x]
+            # Convert RGB to grayscale using the luminosity method
+            gray = int(0.299 * r + 0.587 * g + 0.114 * b)
+            grayscale_row.append(gray)
+        grayscale_image.append(grayscale_row)
+    
+    return grayscale_image
+
+def apply_smoothing(grayscale_image):
+    """
+    Apply a simple averaging filter to smooth the grayscale image.
+    
+    :param grayscale_image: A 2D list of grayscale pixel values [[gray, ...], ...]
+    :return: A 2D list of smoothed grayscale pixel values [[gray, ...], ...]
+    """
+    height = len(grayscale_image)
+    width = len(grayscale_image[0])
+    
+    smoothed_image = [[0 for _ in range(width)] for _ in range(height)]
+    
+    for y in range(1, height - 1):
+        for x in range(1, width - 1):
+            sum_gray = 0
+            for dy in range(-1, 2):
+                for dx in range(-1, 2):
+                    sum_gray += grayscale_image[y + dy][x + dx]
+            smoothed_image[y][x] = sum_gray // 9
+    
+    return smoothed_image
+
+def histogram_equalization(grayscale_image):
+    """
+    Apply histogram equalization to enhance the contrast of the grayscale image.
+    
+    :param grayscale_image: A 2D list of grayscale pixel values [[gray, ...], ...]
+    :return: A 2D list of equalized grayscale pixel values [[gray, ...], ...]
+    """
+    height = len(grayscale_image)
+    width = len(grayscale_image[0])
+    
+    # Compute the histogram
+    histogram = [0] * 256
+    for row in grayscale_image:
+        for gray in row:
+            histogram[gray] += 1
+    
+    # Compute the cumulative distribution function (CDF)
+    cdf = [0] * 256
+    cdf[0] = histogram[0]
+    for i in range(1, 256):
+        cdf[i] = cdf[i - 1] + histogram[i]
+    
+    # Normalize the CDF
+    cdf_min = min(cdf)
+    cdf_max = max(cdf)
+    if cdf_max == cdf_min:
+        return grayscale_image  # Avoid division by zero
+    
+    # Apply histogram equalization
+    equalized_image = [[0 for _ in range(width)] for _ in range(height)]
+    for y in range(height):
+        for x in range(width):
+            gray = grayscale_image[y][x]
+            equalized_image[y][x] = int((cdf[gray] - cdf_min) / (cdf_max - cdf_min) * 255)
+    
+    return equalized_image
+
+
+MODEL_CACHE = {"clf": None}
+embe
+
+def get_model():
+    if MODEL_CACHE["clf"] is None:
+        MODEL_CACHE["clf"] = load_model_if_exists()
+    return MODEL_CACHE["clf"]
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(APP_DIR, "attendance.db")
 DATASET_DIR = os.path.join(APP_DIR, "dataset")
 os.makedirs(DATASET_DIR, exist_ok=True)
+
+def get_db():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 TRAIN_STATUS_FILE = os.path.join(APP_DIR, "train_status.json")
 
@@ -27,7 +118,7 @@ app = Flask(__name__, static_folder="static", template_folder="templates")
 
 # ---------- DB helpers ----------
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db()
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS students (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,7 +160,7 @@ def index():
 
 @app.route("/next_roll")
 def next_roll():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db()
     c = conn.cursor()
     c.execute("SELECT MAX(CAST(roll AS INTEGER)) FROM students WHERE roll != ''")
     max_roll = c.fetchone()[0] or 0
@@ -79,12 +170,12 @@ def next_roll():
 @app.route("/attendance_stats")
 def attendance_stats():
     import pandas as pd
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db()
     df = pd.read_sql_query("SELECT timestamp FROM attendance", conn)
     conn.close()
     if df.empty:
         from datetime import date, timedelta
-        days = [(date.today() - datetime.timedelta(days=i)).strftime("%d-%b") for i in range(29, -1, -1)]
+        days = [(date.today() - timedelta(days=i)).strftime("%d-%b") for i in range(29, -1, -1)]
         return jsonify({"dates": days, "counts": [0]*30})
     df['date'] = pd.to_datetime(df['timestamp']).dt.date
     last_30 = [(datetime.date.today() - datetime.timedelta(days=i)) for i in range(29, -1, -1)]
@@ -99,12 +190,12 @@ def add_student():
     data = request.form
     name = data.get("name", "").strip()
     roll = data.get("roll", "").strip()
-    cls  = data.get("class", "").strip()
-    sec  = data.get("sec", "").strip()
+    cls = data.get("class", "").strip()
+    sec = data.get("sec", "").strip()
     reg_no = data.get("reg_no", "").strip()
     if not name:
         return jsonify({"error": "name required"}), 400
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db()
     c = conn.cursor()
     if roll:
         c.execute("SELECT id FROM students WHERE roll = ?", (roll,))
@@ -127,7 +218,10 @@ def upload_face():
         return jsonify({"error": "student_id required"}), 400
     files = request.files.getlist("images[]")
     folder = os.path.join(DATASET_DIR, student_id)
-    saved_count = save_images_with_white_bg(files, folder)
+    saved_count = 0
+    for f in files:
+        f.save(os.path.join(folder, f.filename))
+        saved_count += 1
     return jsonify({"saved": saved_count})
 
 @app.route("/train_model", methods=["GET"])
@@ -156,9 +250,7 @@ def mark_attendance_page():
 def student_portal():
     return render_template("student_portal.html")
 
-# ------------------------------------------------------------------
-# HARDENED RECOGNITION
-# ------------------------------------------------------------------
+
 @app.route("/recognize_face", methods=["POST"])
 def recognize_face():
     if "image" not in request.files:
@@ -166,51 +258,70 @@ def recognize_face():
     img_file = request.files["image"]
     try:
         image_bytes = img_file.read()
-        embeddings = extract_embedding_for_image(io.BytesIO(image_bytes))
-        if not embeddings:
+        
+        # Manually decode the image bytes to RGB format
+        from PIL import Image
+        from io import BytesIO
+        
+        image = Image.open(BytesIO(image_bytes))
+        rgb_image = list(image.getdata())
+        width, height = image.size
+        
+        # Convert the flat list of RGB tuples to a 2D list
+        rgb_image_2d = [rgb_image[i * width:(i + 1) * width] for i in range(height)]
+        
+        # Convert the RGB image to grayscale
+        grayscale_image = rgb_to_grayscale(rgb_image_2d)
+        
+        # Apply smoothing to the grayscale image
+        smoothed_image = apply_smoothing(grayscale_image)
+        
+        # Apply histogram equalization to enhance contrast
+        equalized_image = histogram_equalization(smoothed_image)
+        
+        # Convert the equalized image back to a format suitable for processing
+        equalized_bytes = bytearray()
+        for row in equalized_image:
+            for gray in row:
+                equalized_bytes.append(gray)
+        
+        # Convert the equalized bytes back to an image
+        equalized_image = Image.frombytes('L', (width, height), bytes(equalized_bytes))
+        
+        # Save the equalized image to a BytesIO object
+        equalized_io = BytesIO()
+        equalized_image.save(equalized_io, format='JPEG')
+        equalized_io.seek(0)
+        
+        # Extract embeddings from the equalized image
+        emb = extract_embedding_for_image(equalized_io)
+        if emb is None:
             return jsonify({"recognized": False, "error": "no face detected"}), 200
-        emb = embeddings[0]
-        clf = load_model_if_exists()
+
+        clf = get_model()
         if clf is None:
             return jsonify({"recognized": False, "error": "model not trained"}), 200
+
         pred_label, conf = predict_with_model(clf, emb)
+        if conf < 0.8:
+            return jsonify({"recognized": False, "reason": "low_confidence", "confidence": float(conf)})
 
-        # ①  stricter gate  (tune 0.8-0.9 as needed)
-        if conf < 0.70:
-            app.logger.warning("Low confidence: student=%s conf=%.2f", pred_label, conf)
-            return jsonify({"recognized": False, "reason": "low_confidence",
-                            "confidence": float(conf)})
-
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db()
         c = conn.cursor()
         c.execute("SELECT name FROM students WHERE id=?", (int(pred_label),))
         row = c.fetchone()
         name = row[0] if row else "Unknown"
 
-        # ②  already marked today ?  reject instead of green-ticking
-# ②  already marked today ?  reject but still send name
-        today = datetime.datetime.now(datetime.UTC).date().isoformat()
-        c.execute("SELECT id FROM attendance WHERE student_id=? AND timestamp>=datetime('now','-1 hour')",
-                (int(pred_label),))
+        today = datetime.date.today().isoformat()
+        c.execute("""SELECT id FROM attendance WHERE student_id = ? AND date(timestamp) = ?""", (int(pred_label), today))
         if c.fetchone():
-            c.execute("SELECT name FROM students WHERE id=?", (int(pred_label),))
-            name = c.fetchone()[0] or "Unknown"
-            conn.close()
-            return jsonify({"recognized": False,
-                            "student_id": int(pred_label),
-                            "name": name,
-                            "error": "Attendance already recorded today"}), 200
+            return jsonify({"recognized": False, "student_id": int(pred_label), "name": name, "error": "Attendance already recorded today"}), 200
 
-        # ③  record attendance
         ts = datetime.datetime.now(datetime.UTC).isoformat()
-        c.execute("INSERT INTO attendance (student_id, name, timestamp) VALUES (?, ?, ?)",
-                  (int(pred_label), name, ts))
+        c.execute("INSERT INTO attendance (student_id, name, timestamp) VALUES (?, ?, ?)", (int(pred_label), name, ts))
         conn.commit()
         conn.close()
-        return jsonify({"recognized": True,
-                        "student_id": int(pred_label),
-                        "name": name,
-                        "confidence": float(conf)}), 200
+        return jsonify({"recognized": True, "student_id": int(pred_label), "name": name, "confidence": float(conf)}), 200
     except Exception as e:
         app.logger.exception("recognize error")
         return jsonify({"recognized": False, "error": str(e)}), 500
@@ -218,7 +329,7 @@ def recognize_face():
 @app.route("/attendance_record", methods=["GET"])
 def attendance_record():
     period = request.args.get("period", "all")
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db()
     c = conn.cursor()
     q = "SELECT id, student_id, name, timestamp FROM attendance"
     params = ()
@@ -239,10 +350,10 @@ def attendance_record():
     rows = c.fetchall()
     conn.close()
     return render_template("attendance_record.html", records=rows, period=period)
-# ---------  COUNT + LIST STUDENTS  ---------
+
 @app.route("/student_count")
 def student_count():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db()
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM students")
     total = c.fetchone()[0]
@@ -251,7 +362,7 @@ def student_count():
 
 @app.route("/download_csv", methods=["GET"])
 def download_csv():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db()
     c = conn.cursor()
     c.execute("SELECT id, student_id, name, timestamp FROM attendance ORDER BY timestamp DESC")
     rows = c.fetchall()
@@ -267,18 +378,17 @@ def download_csv():
 
 @app.route("/students", methods=["GET"])
 def students_list():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db()
     c = conn.cursor()
     c.execute("SELECT id, name, roll, class, section, reg_no, created_at FROM students ORDER BY id DESC")
     rows = c.fetchall()
     conn.close()
-    data = [{"id": r[0], "name": r[1], "roll": r[2], "class": r[3],
-             "section": r[4], "reg_no": r[5], "created_at": r[6]} for r in rows]
+    data = [{"id": r[0], "name": r[1], "roll": r[2], "class": r[3], "section": r[4], "reg_no": r[5], "created_at": r[6]} for r in rows]
     return jsonify({"students": data})
 
 @app.route("/students/<int:sid>", methods=["DELETE"])
 def delete_student(sid):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db()
     c = conn.cursor()
     c.execute("DELETE FROM students WHERE id=?", (sid,))
     c.execute("DELETE FROM attendance WHERE student_id=?", (sid,))
