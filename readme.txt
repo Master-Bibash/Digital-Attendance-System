@@ -1,7 +1,2 @@
-## wipe everything
-
-taskkill /F /IM python.exe 2>$null
-Remove-Item attendance.db, train_status.json, model.pkl -ErrorAction SilentlyContinue
-Get-ChildItem dataset -Directory | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-
- python reset_db.py
+// remove garna lai 
+Remove-Item -Force attendance.db, model.pkl, train_status.json -ErrorAction SilentlyContinue; Remove-Item -Recurse -Force dataset -ErrorAction SilentlyContinue; Write-Host "✨ All data cleared!"

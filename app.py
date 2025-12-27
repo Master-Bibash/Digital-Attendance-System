@@ -6,6 +6,7 @@ import datetime
 import json
 from flask import Flask, render_template, request, jsonify, send_file
 
+from functions import apply_smoothing, histogram_equalization, rgb_to_grayscale
 from model import (
     load_model_if_exists,
     extract_embedding_for_image,
@@ -13,91 +14,11 @@ from model import (
     predict_with_model
 )
 
-def rgb_to_grayscale(rgb_image):
-    """
-    Convert an RGB image to grayscale.
-    
-    :param rgb_image: A 3D list of RGB pixel values [[(R, G, B), ...], ...]
-    :return: A 2D list of grayscale pixel values [[gray, ...], ...]
-    """
-    height = len(rgb_image)
-    width = len(rgb_image[0])
-    
-    grayscale_image = []
-    
-    for y in range(height):
-        grayscale_row = []
-        for x in range(width):
-            r, g, b = rgb_image[y][x]
-            # Convert RGB to grayscale using the luminosity method
-            gray = int(0.299 * r + 0.587 * g + 0.114 * b)
-            grayscale_row.append(gray)
-        grayscale_image.append(grayscale_row)
-    
-    return grayscale_image
 
-def apply_smoothing(grayscale_image):
-    """
-    Apply a simple averaging filter to smooth the grayscale image.
-    
-    :param grayscale_image: A 2D list of grayscale pixel values [[gray, ...], ...]
-    :return: A 2D list of smoothed grayscale pixel values [[gray, ...], ...]
-    """
-    height = len(grayscale_image)
-    width = len(grayscale_image[0])
-    
-    smoothed_image = [[0 for _ in range(width)] for _ in range(height)]
-    
-    for y in range(1, height - 1):
-        for x in range(1, width - 1):
-            sum_gray = 0
-            for dy in range(-1, 2):
-                for dx in range(-1, 2):
-                    sum_gray += grayscale_image[y + dy][x + dx]
-            smoothed_image[y][x] = sum_gray // 9
-    
-    return smoothed_image
 
-def histogram_equalization(grayscale_image):
-    """
-    Apply histogram equalization to enhance the contrast of the grayscale image.
-    
-    :param grayscale_image: A 2D list of grayscale pixel values [[gray, ...], ...]
-    :return: A 2D list of equalized grayscale pixel values [[gray, ...], ...]
-    """
-    height = len(grayscale_image)
-    width = len(grayscale_image[0])
-    
-    # Compute the histogram
-    histogram = [0] * 256
-    for row in grayscale_image:
-        for gray in row:
-            histogram[gray] += 1
-    
-    # Compute the cumulative distribution function (CDF)
-    cdf = [0] * 256
-    cdf[0] = histogram[0]
-    for i in range(1, 256):
-        cdf[i] = cdf[i - 1] + histogram[i]
-    
-    # Normalize the CDF
-    cdf_min = min(cdf)
-    cdf_max = max(cdf)
-    if cdf_max == cdf_min:
-        return grayscale_image  # Avoid division by zero
-    
-    # Apply histogram equalization
-    equalized_image = [[0 for _ in range(width)] for _ in range(height)]
-    for y in range(height):
-        for x in range(width):
-            gray = grayscale_image[y][x]
-            equalized_image[y][x] = int((cdf[gray] - cdf_min) / (cdf_max - cdf_min) * 255)
-    
-    return equalized_image
 
 
 MODEL_CACHE = {"clf": None}
-embe
 
 def get_model():
     if MODEL_CACHE["clf"] is None:
@@ -303,7 +224,7 @@ def recognize_face():
             return jsonify({"recognized": False, "error": "model not trained"}), 200
 
         pred_label, conf = predict_with_model(clf, emb)
-        if conf < 0.8:
+        if conf < 0.7:
             return jsonify({"recognized": False, "reason": "low_confidence", "confidence": float(conf)})
 
         conn = get_db()
@@ -321,6 +242,8 @@ def recognize_face():
         c.execute("INSERT INTO attendance (student_id, name, timestamp) VALUES (?, ?, ?)", (int(pred_label), name, ts))
         conn.commit()
         conn.close()
+        print(f"Recognized: {name}, Confidence: {conf}")
+
         return jsonify({"recognized": True, "student_id": int(pred_label), "name": name, "confidence": float(conf)}), 200
     except Exception as e:
         app.logger.exception("recognize error")

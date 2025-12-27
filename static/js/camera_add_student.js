@@ -12,7 +12,7 @@ const uploadStat = document.getElementById('uploadStatus');
 
 let student_id = null;
 let captured = 0;
-const maxImages = 50;
+const maxImages = 15;
 let images = [];
 let stream = null;
 
@@ -30,19 +30,22 @@ document.getElementById("studentForm").addEventListener("submit", async (e) => {
   document.dispatchEvent(new Event('studentSaved')); // unlock upload
 });
 
-/* ---------- live capture ---------- */
 startCaptureBtn.addEventListener("click", async () => {
+  if (!student_id) { alert("Save student info first"); return; }
   startCaptureBtn.disabled = true;
+  captured = 0;
+  images = [];
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
-    video.srcObject = stream;
-    await video.play();
-    captureImagesLoop();
+      stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+      video.srcObject = stream;
+      await video.play();
+      await captureImagesLoop();
   } catch (err) {
-    alert("Camera access error: " + err.message);
-    startCaptureBtn.disabled = false;
+      alert("Camera access error: " + err.message);
+      startCaptureBtn.disabled = false;
   }
 });
+
 
 async function captureImagesLoop() {
   const canvas = document.createElement("canvas");

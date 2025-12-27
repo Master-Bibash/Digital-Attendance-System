@@ -8,9 +8,13 @@ const recognizedList = document.getElementById("recognizedList");
 let markStream = null;
 let markInterval = null;
 let recognizedIds = new Set();
+let isProcessing = false;   // ✅ REQUIRED
+
 
 startMarkBtn.addEventListener("click", async () => {
   startMarkBtn.disabled = true;
+  recognizedIds.clear(); // optional but clean
+
   stopMarkBtn.disabled = false;
   try {
     markStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
@@ -26,53 +30,98 @@ startMarkBtn.addEventListener("click", async () => {
 });
 
 stopMarkBtn.addEventListener("click", () => {
-  if (markInterval) clearInterval(markInterval);
-  if (markStream) markStream.getTracks().forEach(t => t.stop());
+  if (markInterval) {
+    clearInterval(markInterval);
+    markInterval = null;
+  }
+    if (markStream) markStream.getTracks().forEach(t => t.stop());
   startMarkBtn.disabled = false;
   stopMarkBtn.disabled = true;
   markStatus.innerText = "Stopped";
 });
-
 async function captureAndRecognize() {
-  const canvas = document.createElement("canvas");
-  canvas.width = markVideo.videoWidth || 640;
-  canvas.height = markVideo.videoHeight || 480;
-  const ctx = canvas.getContext("2d");
-  ctx.drawImage(markVideo, 0, 0, canvas.width, canvas.height);
-  const blob = await new Promise(r => canvas.toBlob(r, "image/jpeg", 0.85));
-  const fd = new FormData();
-  fd.append("image", blob, "snap.jpg");
+  if (isProcessing) return;
+  if (!markStream || !markVideo.srcObject) return;
+
+  isProcessing = true;
+
   try {
+    const canvas = document.createElement("canvas");
+    canvas.width = markVideo.videoWidth || 640;
+    canvas.height = markVideo.videoHeight || 480;
+
+    const ctx = canvas.getContext("2d");
+
+    // ✅ SAFETY CHECK
+    if (markVideo.readyState < 2) {
+      isProcessing = false;
+      return;
+    }
+
+    ctx.drawImage(markVideo, 0, 0, canvas.width, canvas.height);
+
+    const blob = await new Promise(r => canvas.toBlob(r, "image/jpeg", 0.85));
+    if (!blob) {
+      isProcessing = false;
+      return;
+    }
+
+    const fd = new FormData();
+    fd.append("image", blob, "snap.jpg");
+
     const res = await fetch("/recognize_face", { method: "POST", body: fd });
     const j = await res.json();
+
     if (j.recognized) {
-      markStatus.innerText = `Recognized: ${j.name} (conf ${Math.round(j.confidence*100)}%)`;
+      markStatus.innerText =
+        `Recognized: ${j.name} (conf ${Math.round(j.confidence * 100)}%)`;
+
       if (!recognizedIds.has(j.student_id)) {
         recognizedIds.add(j.student_id);
+
         const li = document.createElement("li");
         li.className = "list-group-item";
         li.innerText = `${j.name} — ${new Date().toLocaleTimeString()}`;
         recognizedList.prepend(li);
       }
-    } else {
-      /*  NEW  */
-      if (j.error === "Attendance already recorded today") {
-        // pretend it was recognised so the user sees the name
-        markStatus.innerText = `✅ ${j.name} already marked today`;
-        if (!recognizedIds.has(j.student_id)) {
-          recognizedIds.add(j.student_id);
-          const li = document.createElement("li");
-          li.className = "list-group-item text-muted";
-          li.innerText = `${j.name} (already marked) — ${new Date().toLocaleTimeString()}`;
-          recognizedList.prepend(li);
-        }
-      } else if (j.error) {
-        markStatus.innerText = `Not recognized: ${j.error}`;
-      } else {
-        markStatus.innerText = "Not recognized";
+
+      // ✅ STOP SAFELY
+      if (markInterval) {
+        clearInterval(markInterval);
+        markInterval = null;
       }
+
+      if (markStream) {
+        markStream.getTracks().forEach(t => t.stop());
+        markStream = null;
+      }
+
+      startMarkBtn.disabled = false;
+      stopMarkBtn.disabled = true;
+      isProcessing = false;
+      return;
     }
+
+    // --- NOT recognized ---
+    if (j.error === "Attendance already recorded today") {
+      markStatus.innerText = `✅ ${j.name} already marked today`;
+
+      if (!recognizedIds.has(j.student_id)) {
+        recognizedIds.add(j.student_id);
+        const li = document.createElement("li");
+        li.className = "list-group-item text-muted";
+        li.innerText = `${j.name} (already marked) — ${new Date().toLocaleTimeString()}`;
+        recognizedList.prepend(li);
+      }
+    } else if (j.error) {
+      markStatus.innerText = `Not recognized: ${j.error}`;
+    } else {
+      markStatus.innerText = "Not recognized";
+    }
+
   } catch (err) {
-    console.error(err);
+    console.error("Recognition error:", err);
+  } finally {
+    isProcessing = false;
   }
 }
